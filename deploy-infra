@@ -1,0 +1,157 @@
+#!/bin/bash
+
+target='k8s-infra'
+exitcode=0
+curdir=$(pwd)
+curpath=$(dirname $0)
+terraform_bin='.tfbin'
+
+[ -f $(dirname $0)/settings ]       && source $(dirname $0)/settings
+[ -f $(dirname $0)/settings.local ] && source $(dirname $0)/settings.local
+
+die () {
+    echo; echo -e "ERROR: $1"; echo; cd $curdir; exit 1
+}
+
+usage () {
+    echo
+    echo "Usage: $(basename $0) <command>"
+    cat <<-EOT
+
+Commands:
+
+    plan	check what should be deployed
+    deploy	create AWS resource or deploy changes
+    destroy	destroy AWS resources totally (be carefull, no roll back)
+
+EOT
+}
+
+check_settings () {
+    param_list=(name region s3_cluster_store public_key_path aws_access_key_id aws_secret_access_key terraform_ver)
+    local errors=0
+    for i in "${param_list[@]}"; do
+        if [ -z "${!i}" ]; then echo "Please set parametr \"$i\" in 'settings' file"; errors=1; fi
+    done
+    if [ $errors -ne 0 ]; then die "Check your 'settings' file"; fi
+    export AWS_ACCESS_KEY_ID=$aws_access_key_id
+    export AWS_SECRET_ACCESS_KEY=$aws_secret_access_key
+}
+
+install_terraform () {
+    mkdir -p $curpath/$terraform_bin
+    curl -sSL https://releases.hashicorp.com/terraform/${terraform_ver}/terraform_${terraform_ver}_linux_amd64.zip -o $curpath/$terraform_bin/tf.zip
+    unzip -qq $curpath/$terraform_bin/tf.zip -d $curpath/$terraform_bin
+    rm -f $curpath/$terraform_bin/tf.zip
+}
+
+
+check_utils () {
+    [ $(uname) != 'Linux' ] && die "Sorry, you must use Linux to run this srcipt"
+    [ -z $(which unzip) ]   && die "Unzip not found! Please install it by \033[1;37msudo apt-get install unzip\033[0m"
+
+    if [ ! -f $curpath/$terraform_bin/terraform ]; then
+        echo 'Install terraform locally'
+        install_terraform
+    else
+        local tf_cur_ver
+        tf_cur_ver=`$curpath/$terraform_bin/terraform version | grep -o 'Terraform v\([0-9]*\.\)\{2\}[0-9]*' | grep -o '\([0-9]*\.\)\{2\}[0-9]*'`
+        if [ "$tf_cur_ver" != "$terraform_ver" ]; then
+            echo 'Update terraform locally'
+            install_terraform
+        fi
+    fi
+}
+
+# Check and create bucket for terraform states
+#
+check_bucket () {
+    if ! aws --region=$region s3 ls $s3_cluster_store >/dev/null 2>&1
+      then
+        aws --region=$region s3 mb s3://$s3_cluster_store
+        exitcode=$?
+    fi
+    [ $exitcode -ne 0 ] && die "Can't access or create S3 bucket '$s3_cluster_store'"
+}
+
+# Initialize remote storage for terraform state file
+#
+sync_state () {
+    cd $curpath/$target
+    echo "Sync Terraform state with S3 bucket"
+    $(pwd)/../$terraform_bin/terraform init \
+      -backend-config="bucket=$s3_cluster_store" \
+      -backend-config="region=$region" \
+      -backend-config="key=kubernetes-cluster-infra.tfstate"
+    if [ $? -ne 0 ]; then die "Terraform can't sync remote state"; fi
+    cd $curdir
+}
+
+# Plan changes
+#
+plan () {
+    cd $curpath/$target
+    $(pwd)/../$terraform_bin/terraform get || exitcode=$?
+    $(pwd)/../$terraform_bin/terraform plan \
+        -var name=$name \
+        -var region=$region \
+        -var public_key_path=$public_key_path \
+        || exitcode=$?
+    if [ $exitcode -ne 0 ]; then die "terraform got error while plan changes"; fi
+    cd $curdir
+}
+
+# Deploy changes
+#
+deploy () {
+    cd $curpath/$target
+    $(pwd)/../$terraform_bin/terraform get || exitcode=$?
+    $(pwd)/../$terraform_bin/terraform apply \
+        -var name=$name \
+        -var region=$region \
+        -var public_key_path=$public_key_path \
+        || exitcode=$?
+    if [ $exitcode -ne 0 ]; then die "terraform got error while deploy changes"; fi
+    cd $curdir
+}
+
+# Destroy infra
+#
+destroy () {
+    cd $curpath/$target
+    $(pwd)/../$terraform_bin/terraform get || exitcode=$?
+    $(pwd)/../$terraform_bin/terraform destroy -force \
+        -var name=$name \
+        -var region=$region \
+        -var public_key_path=$public_key_path \
+        || exitcode=$?
+    if [ $exitcode -ne 0 ]; then die "terraform got error while destroy aws resources"; fi
+    cd $curdir
+}
+
+initiate () {
+    echo 'Ckeck settings'; check_settings
+    echo 'Check utils installed'; check_utils
+    echo 'Check AWS bucket to store terraform state'; check_bucket
+    echo 'Sync terraform state'; sync_state
+}
+
+# Main
+#
+case "$1" in
+    plan)
+        initiate
+        plan
+        ;;
+    deploy)
+        initiate
+        deploy
+        ;;
+    destroy)
+        initiate
+        destroy
+        ;;
+    *)
+        usage
+        ;;
+esac

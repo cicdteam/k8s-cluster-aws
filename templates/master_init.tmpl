@@ -1,0 +1,129 @@
+#!/bin/bash
+
+# Pod networking manifests
+#
+calico_rbac_url='http://docs.projectcalico.org/v2.2/getting-started/kubernetes/installation/hosted/rbac.yaml'
+calico_url='http://docs.projectcalico.org/v2.2/getting-started/kubernetes/installation/hosted/kubernetes-datastore/calico-networking/1.6/calico.yaml'
+calico_pod_cidr='192.168.0.0/16'
+
+echo 'OS UPDATE'
+sudo apt-get -yq update
+sudo apt-get -yq install \
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    software-properties-common \
+    nfs-common
+
+echo 'SET HOSTNAME'
+nodename=$(curl 169.254.169.254/latest/meta-data/local-hostname)
+echo $nodename | sudo tee /etc/hostname
+sudo hostname $nodename
+
+echo 'SPECIFY NFS MOUNT POINT'
+sudo mkdir -p /efs/
+echo '${efs_id}.efs.${region}.amazonaws.com:/ /efs nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 0 0' | sudo tee -a /etc/fstab
+
+echo 'MOUNT EFS VOLUME'
+while ! host ${efs_id}.efs.${region}.amazonaws.com; do echo 'Wait EFS endpoint'; sleep 10; done; sleep 1
+mount /efs
+
+echo 'INSTALL DOCKER'
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+sudo apt-get -yq update
+#sudo apt-get -yq install docker-ce
+sudo apt-get -yq install docker.io
+sudo usermod -aG docker ubuntu
+sudo docker info
+
+echo 'CREATE SUBDIRS ON EFS VOLUME'
+[ ! -d /efs/k8s-data ]                && sudo mkdir -p /efs/k8s-data
+[ ! -d /efs/k8s-data/lib/etcd ]       && sudo mkdir -p /efs/k8s-data/lib/etcd
+[ ! -d /efs/k8s-data/etc/kubernetes ] && sudo mkdir -p /efs/k8s-data/etc/kubernetes
+
+echo 'LINK KUBE RELATED DIRS FROM EFS TO HOSTPATH'
+sudo ln -s /efs/k8s-data/lib/etcd       /var/lib/etcd
+sudo ln -s /efs/k8s-data/etc/kubernetes /etc/kubernetes
+
+echo 'INSTALL KUBERNETES COMPONENTS'
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+echo 'deb http://apt.kubernetes.io/ kubernetes-xenial main' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get -yq update
+sudo apt-get -yq install kubelet kubeadm kubectl kubernetes-cni
+
+echo 'UPDATE KUBELET ARGS TO USE AWS CLOUD-PROVIDER AND SET LABELS'
+[ ! -d /etc/systemd/system/kubelet.service.d ] && sudo mkdir -p /etc/systemd/system/kubelet.service.d
+cat <<-'EOF' | sudo tee /etc/systemd/system/kubelet.service.d/20-cloud-provider.conf
+	[Service]
+	Environment="KUBELET_EXTRA_ARGS=--cloud-provider=aws --node-labels=kubernetes.io/role=master,node-role.kubernetes.io/master=''"
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet.service
+
+# Initalize master if it was not initalized before
+#
+if [ ! -f /etc/kubernetes/kubelet.conf ]; then
+    echo 'INITALIZE KUBERNETES MASTER'
+
+    intIP=$(curl -sSL http://169.254.169.254/latest/meta-data/local-ipv4)
+    extIP=$(curl -sSL http://169.254.169.254/latest/meta-data/public-ipv4)
+    token=$(sudo kubeadm token generate)
+    echo "$token" | sudo tee /efs/k8s-data/jointoken
+    echo "$intIP" | sudo tee /efs/k8s-data/joinaddr
+
+    cat <<-EOF | sudo tee /etc/kubernetes/kubeadm.conf
+	kind: MasterConfiguration
+	apiVersion: kubeadm.k8s.io/v1alpha1
+	api:
+	  advertiseAddress: $extIP
+	  bindPort: 6443
+	cloudProvider: aws
+	token: $token
+	networking:
+	  podSubnet: $calico_pod_cidr
+	apiServerCertSANs:
+	  - $intIP
+	  - $extIP
+	  - $nodename
+	  - kubernetes
+	  - kubernetes.default
+	  - kubernetes.default.svc
+	  - kubernetes.default.svc.cluster.local
+EOF
+
+    sudo kubeadm init --skip-preflight-checks --config=/etc/kubernetes/kubeadm.conf
+
+    echo 'INSTALL POD NETWORKING'
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f $calico_rbac_url
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f $calico_url
+fi
+
+echo 'WAITING NODE COME ONLINE'
+while ! kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes $nodename --no-headers; do sleep 5; done
+
+echo 'ENSURE MASTER NODE HAS APROPRIATE LABEL'
+while ! kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers -l node-role.kubernetes.io/master | grep -o $nodename; do
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf label nodes $nodename node-role.kubernetes.io/master='' --overwrite
+done
+while ! kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers -l kubernetes.io/role=master | grep -o $nodename; do
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf label nodes $nodename kubernetes.io/role=master --overwrite
+done
+
+echo 'ADDING DEFAULT STORAGE CLASS'
+cat <<'EOF' | kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: default
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: kubernetes.io/aws-ebs
+EOF
+
+echo 'COPYING KUBECTL CONFIG TO REGULAR USER'
+sudo mkdir -p /home/ubuntu/.kube
+sudo cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+sudo chown -R ubuntu:ubuntu /home/ubuntu/.kube
+
+echo 'DONE'

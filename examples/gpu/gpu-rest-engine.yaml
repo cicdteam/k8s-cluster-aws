@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-rest-engine
+spec:
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    app: gpu-rest-engine
+
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: gpu-rest-engine
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: gpu-rest-engine
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: alpha.kubernetes.io/nvidia-gpu-name
+                operator: Exists
+      containers:
+      - name: gpu-rest-engine
+        image: pure/gpu-rest-engine:latest
+        ports:
+        - containerPort: 8000
+        resources:
+          limits:
+            alpha.kubernetes.io/nvidia-gpu: 1
+        volumeMounts:
+        - name: bin
+          mountPath: /usr/local/nvidia/bin
+        - name: lib
+          mountPath: /usr/local/nvidia/lib
+      volumes:
+      - name: bin
+        hostPath:
+          path: /usr/local/nvidia/bin
+      - name: lib
+        hostPath:
+          path: /usr/local/nvidia/lib

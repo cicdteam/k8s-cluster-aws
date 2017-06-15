@@ -1,0 +1,17 @@
+# Configuration file used to override some variables
+# This file not synces with GitHub repo.
+#
+# Put 'settings.local' near with 'settings' file and
+# it will be loaded AFTER main 'settings' file.
+#
+# You can override any variables specified in main 'settings' file
+#
+
+region=eu-west-1
+name=SuperCluster
+s3_cluster_store=my-special-bucket
+
+public_key_path=~/.ssh/special_id_rsa.pub
+
+worker_count_max=0
+spot_count_max=10

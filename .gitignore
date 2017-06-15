@@ -1,0 +1,7 @@
+.terraform
+*tfstate*
+.tfbin
+terraform-error-*.log
+settings.local
+manifestos/*
+!manifestos/.keep

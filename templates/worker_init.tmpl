@@ -1,0 +1,94 @@
+#!/bin/bash
+
+echo 'OS UPDATE'
+sudo apt-get -yq update
+sudo apt-get -yq install \
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    software-properties-common \
+    nfs-common \
+    jq \
+    awscli
+
+echo 'SET HOSTNAME'
+echo $(curl 169.254.169.254/latest/meta-data/local-hostname) | sudo tee /etc/hostname
+sudo hostname $(curl 169.254.169.254/latest/meta-data/local-hostname)
+
+echo 'INSTALL NFS CLIENT'
+sudo mkdir -p /efs/
+echo '${efs_id}.efs.${region}.amazonaws.com:/ /efs nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 0 0' | sudo tee -a /etc/fstab
+
+echo 'MOUNT EFS VOLUME'
+while ! host ${efs_id}.efs.${region}.amazonaws.com; do echo 'Wait EFS endpoint'; sleep 10; done; sleep 1
+mount /efs
+
+echo 'INSTALL DOCKER'
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+sudo apt-get -yq update
+#sudo apt-get -yq install docker-ce
+sudo apt-get -yq install docker.io
+sudo usermod -aG docker ubuntu
+sudo docker info
+
+#
+# GPU support
+#
+if [ "$(lspci | grep -i nvidia)" ]; then
+    echo 'INSTALL NVIDIA GPU-CARD SUPPORT'
+    wget -q http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1604/x86_64/cuda-repo-ubuntu1604_8.0.61-1_amd64.deb
+    sudo dpkg -i cuda-repo-ubuntu1604_8.0.61-1_amd64.deb
+    rm -f cuda-repo-ubuntu1604_8.0.61-1_amd64.deb
+    sudo apt-get -yq update
+    sudo apt-get -yq install nvidia-375 nvidia-modprobe libcuda1-375 --no-install-recommends
+    sudo mkdir -p /usr/local/nvidia/lib /usr/local/nvidia/bin
+    sudo mv /usr/lib/nvidia-375/lib*  /usr/local/nvidia/lib/
+    sudo mv /usr/lib/nvidia-375/bin/* /usr/local/nvidia/bin/
+    sudo mv /usr/lib/x86_64-linux-gnu/libcuda* /usr/local/nvidia/lib/
+    echo '/usr/local/nvidia/lib' | sudo tee /etc/ld.so.conf.d/local-nvidia.conf
+    ldconfig
+    echo 'CKECK NVIDIA DRIVERS WORKING'
+    export PATH=/usr/local/nvidia/bin:$PATH
+    nvidia-smi
+fi
+
+echo 'INSTALL KUBERNETES COMPONENTS'
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+echo 'deb http://apt.kubernetes.io/ kubernetes-xenial main' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get -yq update
+sudo apt-get -yq install kubelet kubeadm kubectl kubernetes-cni
+
+echo 'INITALIZE KUBERNETES WORKER'
+while [ ! -f /efs/k8s-data/jointoken ]; do echo 'Waiting for token'; sleep 10; done
+while [ ! -f /efs/k8s-data/joinaddr ];  do echo 'Waiting for addr';  sleep 10; done
+
+token=$(sudo cat /efs/k8s-data/jointoken)
+addr=$(sudo cat /efs/k8s-data/joinaddr)
+
+sudo kubeadm join --skip-preflight-checks --token=$token $addr:6443
+
+echo 'UPDATE KUBELET TO USE AWS CLOUD-PROVIDER AND SET NODE LABELS'
+# preparing node labels
+aws configure set region $(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
+lifecycle=$(aws ec2 describe-instances --instance-ids $(curl -s http://169.254.169.254/latest/meta-data/instance-id) | jq -r '.Reservations[].Instances[].InstanceLifecycle')
+if [ "$lifecycle" = "spot" ]; then NODEROLE="spotnode"; else NODEROLE="node"; fi
+
+# labeling
+[ ! -d /etc/systemd/system/kubelet.service.d ] && mkdir -p /etc/systemd/system/kubelet.service.d
+if [ "$(lspci | grep -i nvidia)" ]; then
+    NVIDIA_GPU_NAME=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader --id=0 | sed 's/[[:space:]]/-/g')
+    cat <<-EOF | sudo tee /etc/systemd/system/kubelet.service.d/20-cloud-provider.conf
+	[Service]
+	Environment="KUBELET_EXTRA_ARGS=--feature-gates=Accelerators=true --cloud-provider=aws --node-labels=kubernetes.io/role=$NODEROLE,node-role.kubernetes.io/$NODEROLE='',alpha.kubernetes.io/nvidia-gpu-name=$NVIDIA_GPU_NAME"
+EOF
+else
+    cat <<-EOF | sudo tee /etc/systemd/system/kubelet.service.d/20-cloud-provider.conf
+	[Service]
+	Environment="KUBELET_EXTRA_ARGS=--cloud-provider=aws --node-labels=kubernetes.io/role=$NODEROLE,node-role.kubernetes.io/$NODEROLE=''"
+EOF
+fi
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet.service
+
+echo 'DONE'
