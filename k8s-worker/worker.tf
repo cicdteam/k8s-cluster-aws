@@ -6,7 +6,7 @@ resource "aws_launch_configuration" "k8s-worker" {
   count = "${var.worker_count_max == "0" ? 0 : 1}"
   associate_public_ip_address = "true"
   name_prefix          = "${var.name}-worker"
-  image_id             = "${data.aws_ami.ubuntu.id}"
+  image_id             = "${data.aws_ami.image.id}"
   instance_type        = "${var.worker_instance_type}"
   iam_instance_profile = "${aws_iam_instance_profile.k8s-worker.id}"
   key_name             = "${data.terraform_remote_state.infra.key_name}"

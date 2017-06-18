@@ -23,7 +23,7 @@ spec:
     - name: bin
       mountPath: /usr/local/nvidia/bin
     - name: lib
-      mountPath: /usr/lib/nvidia
+      mountPath: /usr/local/nvidia/lib
   volumes:
   - name: bin
     hostPath:

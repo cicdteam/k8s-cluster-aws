@@ -7,7 +7,7 @@ resource "aws_launch_configuration" "k8s-spotworker" {
   associate_public_ip_address = "true"
   spot_price           = "${var.spot_price_max}"
   name_prefix          = "${var.name}-spotworker"
-  image_id             = "${data.aws_ami.ubuntu.id}"
+  image_id             = "${data.aws_ami.image.id}"
   instance_type        = "${var.spot_instance_type}"
   iam_instance_profile = "${aws_iam_instance_profile.k8s-worker.id}"
   key_name             = "${data.terraform_remote_state.infra.key_name}"

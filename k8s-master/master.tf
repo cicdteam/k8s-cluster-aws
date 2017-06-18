@@ -5,13 +5,12 @@
 data "template_file" "k8s-master" {
   template               = "${file("${path.module}/../templates/master_init.tmpl")}"
   vars {
-    region               = "${var.region}"
-    efs_id               = "${data.terraform_remote_state.infra.efs_id}"
+    token                = "${data.terraform_remote_state.infra.init-token}"
   }
 }
 
 resource "aws_instance" "k8s-master" {
-  ami                    = "${data.aws_ami.ubuntu.id}"
+  ami                    = "${data.aws_ami.image.id}"
   key_name               = "${data.terraform_remote_state.infra.key_name}"
   instance_type          = "${var.master_instance_type}"
   iam_instance_profile   = "${aws_iam_instance_profile.k8s-master.id}"

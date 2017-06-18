@@ -46,7 +46,7 @@ spec:
       volumes:
       - name: bin
         hostPath:
-          path: /usr/local/nvidia/bin
+          path: /usr/lib/nvidia/bin
       - name: lib
         hostPath:
-          path: /usr/local/nvidia/lib
+          path: /usr/lib/nvidia

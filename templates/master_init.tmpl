@@ -1,56 +1,43 @@
 #!/bin/bash
 
-# Pod networking manifests
-#
-calico_rbac_url='http://docs.projectcalico.org/v2.2/getting-started/kubernetes/installation/hosted/rbac.yaml'
-calico_url='http://docs.projectcalico.org/v2.2/getting-started/kubernetes/installation/hosted/kubernetes-datastore/calico-networking/1.6/calico.yaml'
-calico_pod_cidr='192.168.0.0/16'
+echo 'WAIT WHILE CLUSTER STORAGE EBS VOLUME ATTACHED'
+instanceId=$(curl -s http://instance-data/latest/meta-data/instance-id)
+region=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
+ebsState="unknown"
+while [ "$ebsState" != "attached" ]; do
+    ebsState=$(aws ec2 describe-volumes \
+        --region $region \
+        --filters \
+            Name=attachment.instance-id,Values=$instanceId \
+            Name=attachment.device,Values=/dev/sdd \
+        --query Volumes[].Attachments[].State \
+        --output text)
 
-echo 'OS UPDATE'
-sudo apt-get -yq update
-sudo apt-get -yq install \
-    apt-transport-https \
-    ca-certificates \
-    curl \
-    software-properties-common \
-    nfs-common
+    sleep 5
+done
+
+# Format /dev/xvdd if it does not contain a partition yet
+if [ "$(file -b -s /dev/xvdd)" == "data" ]; then
+    echo 'FORMAT CLUSTER STORAGE VOLUME'
+    sudo mkfs.ext4 /dev/xvdd
+fi
+
+echo 'MOUNT CLUSTER STORAGE VOLUME'
+echo '/dev/xvdd /k8s-cluster ext4 defaults,nofail 0 0' | sudo tee -a /etc/fstab
+sudo mkdir /k8s-cluster; sudo mount /k8s-cluster
+echo '/k8s-cluster/etcd /var/lib/etcd none bind' | sudo tee -a /etc/fstab
+echo '/k8s-cluster/kubernetes /etc/kubernetes none bind' | sudo tee -a /etc/fstab
+sudo mkdir -p /k8s-cluster/etcd /var/lib/etcd; sudo mount /var/lib/etcd
+sudo mkdir -p /k8s-cluster/kubernetes /etc/kubernetes; sudo mount /etc/kubernetes
 
 echo 'SET HOSTNAME'
-nodename=$(curl 169.254.169.254/latest/meta-data/local-hostname)
+nodename=$(curl -s 169.254.169.254/latest/meta-data/local-hostname)
 echo $nodename | sudo tee /etc/hostname
 sudo hostname $nodename
 
-echo 'SPECIFY NFS MOUNT POINT'
-sudo mkdir -p /efs/
-echo '${efs_id}.efs.${region}.amazonaws.com:/ /efs nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 0 0' | sudo tee -a /etc/fstab
-
-echo 'MOUNT EFS VOLUME'
-while ! host ${efs_id}.efs.${region}.amazonaws.com; do echo 'Wait EFS endpoint'; sleep 10; done; sleep 1
-mount /efs
-
-echo 'INSTALL DOCKER'
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-sudo apt-get -yq update
-#sudo apt-get -yq install docker-ce
-sudo apt-get -yq install docker.io
-sudo usermod -aG docker ubuntu
-sudo docker info
-
-echo 'CREATE SUBDIRS ON EFS VOLUME'
-[ ! -d /efs/k8s-data ]                && sudo mkdir -p /efs/k8s-data
-[ ! -d /efs/k8s-data/lib/etcd ]       && sudo mkdir -p /efs/k8s-data/lib/etcd
-[ ! -d /efs/k8s-data/etc/kubernetes ] && sudo mkdir -p /efs/k8s-data/etc/kubernetes
-
-echo 'LINK KUBE RELATED DIRS FROM EFS TO HOSTPATH'
-sudo ln -s /efs/k8s-data/lib/etcd       /var/lib/etcd
-sudo ln -s /efs/k8s-data/etc/kubernetes /etc/kubernetes
-
-echo 'INSTALL KUBERNETES COMPONENTS'
-curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
-echo 'deb http://apt.kubernetes.io/ kubernetes-xenial main' | sudo tee /etc/apt/sources.list.d/kubernetes.list
-sudo apt-get -yq update
-sudo apt-get -yq install kubelet kubeadm kubectl kubernetes-cni
+echo 'RUN DOCKER DAEMON'
+sudo systemctl enable docker.service
+sudo systemctl start docker.service
 
 echo 'UPDATE KUBELET ARGS TO USE AWS CLOUD-PROVIDER AND SET LABELS'
 [ ! -d /etc/systemd/system/kubelet.service.d ] && sudo mkdir -p /etc/systemd/system/kubelet.service.d
@@ -59,18 +46,16 @@ cat <<-'EOF' | sudo tee /etc/systemd/system/kubelet.service.d/20-cloud-provider.
 	Environment="KUBELET_EXTRA_ARGS=--cloud-provider=aws --node-labels=kubernetes.io/role=master,node-role.kubernetes.io/master=''"
 EOF
 sudo systemctl daemon-reload
-sudo systemctl restart kubelet.service
+sudo systemctl enable kubelet.service
+sudo systemctl start kubelet.service
 
 # Initalize master if it was not initalized before
 #
 if [ ! -f /etc/kubernetes/kubelet.conf ]; then
     echo 'INITALIZE KUBERNETES MASTER'
 
-    intIP=$(curl -sSL http://169.254.169.254/latest/meta-data/local-ipv4)
-    extIP=$(curl -sSL http://169.254.169.254/latest/meta-data/public-ipv4)
-    token=$(sudo kubeadm token generate)
-    echo "$token" | sudo tee /efs/k8s-data/jointoken
-    echo "$intIP" | sudo tee /efs/k8s-data/joinaddr
+    intIP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+    extIP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
 
     cat <<-EOF | sudo tee /etc/kubernetes/kubeadm.conf
 	kind: MasterConfiguration
@@ -79,9 +64,9 @@ if [ ! -f /etc/kubernetes/kubelet.conf ]; then
 	  advertiseAddress: $extIP
 	  bindPort: 6443
 	cloudProvider: aws
-	token: $token
+	token: ${token}
 	networking:
-	  podSubnet: $calico_pod_cidr
+	  podSubnet: 192.168.0.0/16
 	apiServerCertSANs:
 	  - $intIP
 	  - $extIP
@@ -95,6 +80,12 @@ EOF
     sudo kubeadm init --skip-preflight-checks --config=/etc/kubernetes/kubeadm.conf
 
     echo 'INSTALL POD NETWORKING'
+
+    # Pod networking manifests
+    #
+    calico_rbac_url='http://docs.projectcalico.org/v2.2/getting-started/kubernetes/installation/hosted/rbac.yaml'
+    calico_url='http://docs.projectcalico.org/v2.2/getting-started/kubernetes/installation/hosted/kubernetes-datastore/calico-networking/1.6/calico.yaml'
+
     kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f $calico_rbac_url
     kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f $calico_url
 fi
@@ -127,3 +118,4 @@ sudo cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
 sudo chown -R ubuntu:ubuntu /home/ubuntu/.kube
 
 echo 'DONE'
+
