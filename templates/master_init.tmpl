@@ -1,10 +1,11 @@
 #!/bin/bash
 
 echo 'WAIT WHILE CLUSTER STORAGE EBS VOLUME ATTACHED'
-instanceId=$(curl -s http://instance-data/latest/meta-data/instance-id)
+instanceId=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
 region=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
 ebsState="unknown"
 while [ "$ebsState" != "attached" ]; do
+    sleep 5
     ebsState=$(aws ec2 describe-volumes \
         --region $region \
         --filters \
@@ -12,12 +13,10 @@ while [ "$ebsState" != "attached" ]; do
             Name=attachment.device,Values=/dev/sdd \
         --query Volumes[].Attachments[].State \
         --output text)
-
-    sleep 5
 done
 
 # Format /dev/xvdd if it does not contain a partition yet
-if [ "$(file -b -s /dev/xvdd)" == "data" ]; then
+if [ "$(sudo file -b -s /dev/xvdd)" == "data" ]; then
     echo 'FORMAT CLUSTER STORAGE VOLUME'
     sudo mkfs.ext4 /dev/xvdd
 fi
